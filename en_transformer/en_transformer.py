@@ -208,7 +208,7 @@ class EquivariantAttention(nn.Module):
 
             self.coors_mlp = nn.Sequential(
                 nn.GELU(),
-                nn.Linear(heads, heads)
+                nn.Linear(heads, heads * 3)
             )
         else:
             self.coors_mlp = nn.Sequential(
@@ -217,13 +217,19 @@ class EquivariantAttention(nn.Module):
                 nn.Linear(coors_hidden_dim, heads)
             )
 
+            self.cross_coors_mlp = nn.Sequential(
+                nn.Linear(heads, coors_hidden_dim),
+                nn.GELU(),
+                nn.Linear(coors_hidden_dim, heads * 2)
+            )
+
         self.coors_gate = nn.Sequential(
             nn.Linear(heads, heads),
             nn.Tanh()
         )
 
         self.norm_rel_coors = CoorsNorm(scale_init = norm_coors_scale_init) if norm_rel_coors else nn.Identity()
-        self.coors_combine = nn.Parameter(torch.randn(heads))
+        self.coors_combine = nn.Parameter(torch.randn(heads * 2))
 
         self.rotary_emb = SinusoidalEmbeddings(dim_head // 2)
         self.rotary_emb_seq = SinusoidalEmbeddings(dim_head // 2) if rel_pos_emb else None
@@ -361,25 +367,45 @@ class EquivariantAttention(nn.Module):
         # coordinate MLP and calculate coordinate updates
 
         coors_mlp_input = rearrange(qk, 'b h i j -> b i j h')
+
         coor_weights = self.coors_mlp(coors_mlp_input)
+        cross_weights = self.cross_coors_mlp(coors_mlp_input)
+
+        cross_weights = rearrange(cross_weights, 'b i j (h n) -> b i j h n', n = 2)
+        cross_weights_i, cross_weights_j = cross_weights.unbind(dim = -1)
+
+        cross_weights = rearrange(cross_weights_i, 'b n i h -> b n i () h') + rearrange(cross_weights_j, 'b n j h -> b n () j h')
 
         if exists(mask):
             mask_value = max_neg_value(coor_weights)
             coor_mask = repeat(mask, 'b () i j -> b i j ()')
-            coor_weights.masked_fill_(~coor_mask, mask_value)
+            coor_weights = coor_weights.masked_fill(~coor_mask, mask_value)
+            cross_weights = cross_weights.masked_fill(~(coor_mask[:, :, :, None, :] * coor_mask[:, :, None, :, :]), mask_value)
+
+        cross_weights = rearrange(cross_weights, 'b n i j h -> b n (i j) h')
 
         coor_attn = coor_weights.softmax(dim = -2)
+        cross_attn = cross_weights.softmax(dim = -2)
 
         rel_coors_sign = self.coors_gate(coors_mlp_input)
         rel_coors_sign = rearrange(rel_coors_sign, 'b i j h -> b i j () h')
 
+        rel_coors_i = repeat(rel_coors, 'b n i c -> b n (i j) c', j = j)
+        rel_coors_j = repeat(rel_coors, 'b n j c -> b n (i j) c', i = j)
+        cross_coors = torch.cross(rel_coors_i, rel_coors_j, dim = -1)
+
         rel_coors = self.norm_rel_coors(rel_coors)
+        cross_coors = self.norm_rel_coors(cross_coors)
 
         rel_coors = repeat(rel_coors, 'b i j c -> b i j c h', h = h)
+        cross_coors = repeat(cross_coors, 'b i j c -> b i j c h', h = h)
 
         rel_coors = rel_coors * rel_coors_sign
 
-        coors_out = einsum('b i j h, b i j c h, h -> b i c', coor_attn, rel_coors, self.coors_combine)
+        cross_out = einsum('b i j h, b i j c h -> b i c h', cross_attn, cross_coors)
+        coors_out = einsum('b i j h, b i j c h -> b i c h', coor_attn, rel_coors)
+
+        coors_out = einsum('b n c h, h -> b n c', torch.cat((coors_out, cross_out), dim = -1), self.coors_combine)
 
         # derive attention
 
